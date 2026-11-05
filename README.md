@@ -1,0 +1,1 @@
+# meta-dwh-usage-model
