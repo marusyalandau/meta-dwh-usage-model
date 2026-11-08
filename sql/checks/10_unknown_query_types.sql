@@ -1,7 +1,8 @@
 -- Query types missing from dim_query_type.
 -- severity: warn
 -- They are reported in the 'other' category. Add them to
--- sql/seed/03_dim_query_type.sql and reload the aggregates.
+-- sql/seed/03_dim_query_type.sql and reload the period with run_daily
+-- (the category is stored in fact_query).
 SELECT
     f.query_type,
     count(*)           AS queries,

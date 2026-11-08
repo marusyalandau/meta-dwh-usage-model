@@ -104,16 +104,19 @@ window for late-arriving events.
  [raw]   raw.trino_query_completed           1 row = 1 query, as produced by Trino
                                 │
                                 │ daily, idempotent load per date (Airflow / run_daily.py)
+                                │ lookups: meta.dim_user_team (SCD2) -> team,
+                                │          meta.dim_query_type -> category
                                 ▼
- [facts] meta.fact_query                     1 row = 1 query (+ team)
-         meta.fact_query_table_access        1 row = 1 query x 1 table read
-                                ▲
-                                │ lookup
- [dims]  meta.dim_user_team (SCD2), meta.dim_team, meta.dim_table, meta.dim_query_type
+ [facts] meta.fact_query                     1 row = 1 query (+ team, category)
+         meta.fact_query_table_access        1 row = 1 query x 1 data table read
                                 │
+                                │ same daily load, from the facts only
                                 ▼
  [aggs]  meta.agg_table_user_daily           1 row = day x table x user x category x client
          meta.agg_team_resources_daily       1 row = day x team x category x client
+ [dims]  meta.dim_table                      1 row = table ever read (built from the facts)
+
+ Reference data: meta.dim_team (team names for reports), meta.dim_user_team, meta.dim_query_type
 ```
 
 ## Data model
@@ -540,8 +543,8 @@ print a warning: the data is still correct, but something needs attention.
 ways to run them are in [Running locally](#running-locally). Every check was
 also tried on deliberately broken data (part of an aggregate day deleted, an
 unknown user and query type, a table removed from `dim_table`, overlapping team
-periods) and reported exactly the broken rows. A raw event delivered twice no
-longer breaks anything: the load drops the copy and all checks pass.
+periods) and reported exactly the broken rows. A raw event delivered twice
+breaks nothing: the load drops the copy and all checks pass.
 
 The checks compare the model with `raw`, so they are meant for recently loaded
 days. After retention has removed old raw events, checks 01 and 03 fail for those
