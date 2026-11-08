@@ -10,8 +10,9 @@ consume, and how this changes over time.
 | --- | --- |
 | Tables, granularity, relationships | [Data model](#data-model), [ER diagram](#er-diagram) |
 | SQL / Python to create and populate | `sql/ddl/`, `sql/seed/`, `sql/transform/`, `pipeline/`, [Running locally](#running-locally) |
+| Example queries | `sql/examples/`, run with `python -m pipeline.run_examples` |
 | Resource usage metrics | [Resource metrics](#resource-metrics), [Query categories](#query-categories) |
-| How data is updated | [How data is updated](#how-data-is-updated) |
+| How data is updated | [How data is updated](#how-data-is-updated), [Data quality checks](#data-quality-checks), [Table maintenance](#table-maintenance-compaction-and-snapshots) |
 | Assumptions | [Assumptions](#assumptions) |
 | Additional metadata | [Required metadata beyond the query log](#required-metadata-beyond-the-query-log) |
 
@@ -31,9 +32,11 @@ In short:
 - **Queries reading several tables:** full cost stays on the query; CPU is split
   across tables proportionally to bytes read.
 - **Updates:** daily loads per date, idempotent (delete + insert), so re-runs and
-  backfills are safe. Late events, retention and Iceberg maintenance are described.
+  backfills are safe. Data quality checks run after every load; a weekly job
+  applies retention and Iceberg maintenance. Handling of late events is described.
 - **Run it:** `bash run_all.sh` starts a local S3 + Iceberg + Trino stack,
-  generates sample events and builds the model.
+  generates sample events, builds the model, checks it, prints the answers of the
+  example queries and runs maintenance (see [Running locally](#running-locally)).
 
 ## Required metadata beyond the query log
 
@@ -419,6 +422,8 @@ Design decisions:
 - Writes also tell who produces a table (`fact_query.output_table_key`), which is
   a useful hint for the table owner (`dim_table.owner_team_id`).
 
+See `sql/examples/03_query_categories.sql`.
+
 ## How data is updated
 
 - Each transformation in `sql/transform/` loads **one date** (`{{ run_date }}`).
@@ -427,6 +432,10 @@ Design decisions:
 - Files are numbered in dependency order.
 - In production this is an Airflow DAG with one run per logical date;
   a backfill is the same DAG run for past dates.
+- After each load, data quality checks verify the result; a failed check fails
+  the DAG run, so a problem is alerted instead of silently showing up in reports
+  (see below).
+- Once a week a separate maintenance job applies retention and compacts the tables.
 
 ### Late-arriving events
 
@@ -450,6 +459,42 @@ cost, so it should be based on measurements rather than guessed:
 
 Not implemented yet: the runner currently loads exactly the dates it is given.
 
+### Data quality checks
+
+After every load `pipeline/checks.py` runs the queries in `sql/checks/`. Each
+query returns the rows that break one rule, so an empty result means the check
+passed. A failed check makes the script exit with code 1, which fails the
+Airflow task and stops the tasks after it. Checks marked `severity: warn` only
+print a warning: the data is still correct, but something needs attention.
+
+| Check | What it catches |
+| --- | --- |
+| `01_raw_no_empty_days` | A day without any events: event delivery was down |
+| `02_fact_query_unique` | The same query loaded twice, so its resources are counted twice |
+| `03_fact_query_matches_raw` | Queries lost or duplicated between `raw` and `fact_query` |
+| `04_fact_query_required_fields` | Empty keys (user, team, query type) or negative metrics |
+| `05_table_access_cpu_matches_query` | Per-table CPU does not add up to the query CPU (0.5 ms rounding per table is allowed) |
+| `06_agg_team_resources_matches_fact` | Team aggregate differs from `fact_query`: queries, CPU or bytes per day |
+| `07_agg_table_user_matches_access` | Table aggregate differs from `fact_query_table_access` |
+| `08_dim_table_covers_access` | A table read in the period is missing from `dim_table` |
+| `09_users_without_team` (warn) | Users missing from the directory; their usage goes to `unknown` |
+| `10_unknown_query_types` (warn) | Query types missing from `dim_query_type`; reported as `other` |
+
+`run_all.sh` runs the checks for the whole period right after the load; other
+ways to run them are in [Running locally](#running-locally). Every check was
+also tried on deliberately broken data (a raw event delivered twice, part of
+an aggregate day deleted, an unknown user and query type, a table removed from
+`dim_table`) and reported exactly the broken rows.
+
+The checks compare the model with `raw`, so they are meant for recently loaded
+days. After retention has removed old raw events, checks 01 and 03 fail for those
+days by design.
+
+The checks run after the data is written, so for a short time reports can see a
+bad load. Iceberg supports *write-audit-publish* to close this gap: load into a
+branch, run the checks there and publish only if they pass. It is not used here
+to keep the pipeline simple.
+
 ### Retention
 
 Each layer keeps as much history as it is useful for, because storage costs money
@@ -464,7 +509,8 @@ Proposed periods (to be agreed with data governance):
 
 Consequence: facts can be rebuilt (backfilled) only for the period still kept in `raw`.
 
-Retention is a daily `DELETE` of old partitions, e.g.
+Retention is a `DELETE` of old partitions, run as the first step of the weekly
+maintenance job (below), e.g.
 `DELETE FROM iceberg.raw.trino_query_completed WHERE event_date < current_date - INTERVAL '90' DAY`.
 Tables are partitioned by date, so Iceberg drops whole files. In Iceberg a
 `DELETE` only removes files from the current snapshot: the files stay in storage
@@ -490,7 +536,27 @@ Proposed schedule: a weekly maintenance job that runs `optimize` and then
 `expire_snapshots` (7 days) on every table of the model; the 7 days are the
 window in which a bad load can still be rolled back with time travel.
 
-Not implemented yet: retention and maintenance are described, not scheduled.
+`pipeline/maintenance.py` implements this job: retention, then `optimize`,
+`expire_snapshots` (7 days) and `remove_orphan_files` for every table in `raw`
+and `meta`. Retention periods are set at the top of the script. In production it
+is a weekly Airflow DAG; locally `run_all.sh` runs it as the last step (see
+[Running locally](#running-locally) for other options).
+
+What it does on the local sample data (October 2026):
+
+- `--as-of 2027-01-15` deletes the raw events of 1-16 October (older than 90
+  days on that date); facts and aggregates are kept.
+- `optimize` compacts each aggregate from 31 small files (one per daily load)
+  into one, and `dim_table` from 61 files (every daily `MERGE` adds files) into
+  one. Facts already have one file per daily partition, so there is nothing to
+  merge.
+- `expire_snapshots` removes nothing locally: all snapshots are younger than 7
+  days, and Trino does not accept a shorter threshold by default
+  (`iceberg.expire-snapshots.min-retention`).
+- Maintenance changes how the data is stored, not the data: the example queries
+  return the same results before and after it. Retention would change them only
+  for periods older than the retention: raw events are not used by reports, and
+  facts are kept for 2 years.
 
 ## Assumptions
 
@@ -530,23 +596,39 @@ trino/catalog/            Trino catalog configuration
 sql/ddl/                  CREATE SCHEMA / CREATE TABLE
 sql/seed/                 sample dimension data (teams, user -> team)
 sql/transform/            daily idempotent loads, parameterised by {{ run_date }}
-pipeline/                 Python: init, fake event generator, daily runner
+sql/checks/               data quality checks, run after each load
+sql/examples/             queries answering the task questions
+pipeline/                 Python: init, fake event generator, daily runner, checks,
+                          maintenance, example runner
+run_all.sh                runs the whole local pipeline end to end
+output/                   example query results written by run_all.sh (not in git)
 ```
 
 ## Running locally
 
 Requirements: Docker, Python 3.10+ (tested on Ubuntu in WSL).
+All commands are run from the repository root.
 
-Quick start: one script runs all the steps below.
+### Quick start
 
 ```bash
-bash run_all.sh                          # wipes old data, then runs everything
+bash run_all.sh                          # October 2026, 31 days
 START=2026-11-01 DAYS=7 bash run_all.sh  # another period
 ```
 
-Step by step:
+The script first checks that Docker and Python are installed and running, and
+if not, prints how to install or start them. Then it does every step from the
+next section, in order: starts the Docker stack (removing old data first),
+prepares the Python environment, creates the tables, generates fake events,
+builds the model, runs the data quality checks, runs the example queries and
+finally runs table maintenance. It stops with an error if any step or check
+fails. The example results are printed and also saved to
+`output/example_results.txt`.
+
+### Step by step
 
 ```bash
+docker compose down                  # remove old data, if the stack was running
 docker compose up -d                 # wait ~30 s until Trino is ready
 
 # Python dependencies go into a virtual environment
@@ -555,17 +637,39 @@ python3 -m venv .venv                # once; may need `sudo apt install python3-
 source .venv/bin/activate            # in every new terminal
 pip install -r requirements.txt
 
-python -m pipeline.init_db                                          # tables + seed dims
-python -m pipeline.generate_events --start 2026-10-01 --days 31     # fake raw events
-python -m pipeline.run_daily --start 2026-10-01 --end 2026-10-31    # backfill the model
+python -m pipeline.init_db                                          # 1. tables + seed dimensions
+python -m pipeline.generate_events --start 2026-10-01 --days 31     # 2. fake raw events
+python -m pipeline.run_daily --start 2026-10-01 --end 2026-10-31    # 3. build facts and aggregates
+python -m pipeline.checks --start 2026-10-01 --end 2026-10-31       # 4. data quality checks
+python -m pipeline.run_examples                                     # 5. example queries and their results
+python -m pipeline.maintenance --as-of 2026-10-31                   # 6. retention, compaction, snapshots
 ```
 
-Then query the tables in DataGrip (Trino data source, `localhost:8080`,
-any user, no password) or in the Trino CLI:
+### Other useful commands
+
+```bash
+python -m pipeline.run_daily --date 2026-10-15                      # reload one day (safe to repeat)
+python -m pipeline.checks --date 2026-10-15                         # check one day
+python -m pipeline.run_examples sql/examples/02_team_resources.sql  # run one example file
+python -m pipeline.maintenance --dry-run                            # only print the maintenance statements
+python -m pipeline.maintenance --as-of 2027-01-15                   # retention as if it were a later day
+```
+
+Without `--as-of`, maintenance counts retention from today, as it would in
+production. The sample data is from October 2026, so a few months later a plain
+run would delete its raw events as older than 90 days. That is why `run_all.sh`
+and the steps above pass the last generated day as `--as-of`.
+
+### Your own queries
+
+Connect DataGrip (Trino data source, `localhost:8080`, any user, no password),
+or open the Trino CLI:
 
 ```bash
 docker compose exec trino trino
 ```
+
+### Notes
 
 The local stack is ephemeral: `docker compose down` removes all data.
 After changing anything in `sql/ddl/`, recreate the stack (`docker compose down`,
