@@ -1,5 +1,7 @@
 -- Mapping of Trino query types to reporting categories.
 -- Types not listed here are reported as 'other'.
+-- One exception is applied in 01_fact_query.sql: a SELECT that reads no data
+-- tables (only system tables, e.g. IDE introspection) is 'metadata'.
 DELETE FROM iceberg.meta.dim_query_type;
 
 INSERT INTO iceberg.meta.dim_query_type (query_type, query_category, description) VALUES

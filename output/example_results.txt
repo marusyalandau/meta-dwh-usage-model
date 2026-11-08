@@ -1,0 +1,137 @@
+================================================================================
+sql/examples/01_distinct_users_per_table.sql
+================================================================================
+
+Q1: How many distinct users queried table X during a given period?
+Distinct counts are not additive, so we count over the user-level daily table.
+
+table_key              | distinct_users | queries
+-----------------------+----------------+--------
+iceberg.product.events | 8              | 1510   
+(1 row)
+
+Trend: distinct users per week for the same table
+
+week       | distinct_users
+-----------+---------------
+2026-09-28 | 8             
+2026-10-05 | 8             
+2026-10-12 | 8             
+2026-10-19 | 8             
+2026-10-26 | 8             
+(5 rows)
+
+================================================================================
+sql/examples/02_team_resources.sql
+================================================================================
+
+Q2: How many resources did team Y consume during a given period?
+CPU time is stored in milliseconds: / 3.6e6 converts it to hours.
+
+team_name         | queries | cpu_hours | tib_read
+------------------+---------+-----------+---------
+Product Analytics | 1727    | 8.64      | 2.373   
+(1 row)
+
+Top tables by CPU for that team in the same period
+
+table_key                   | cpu_hours | distinct_users
+----------------------------+-----------+---------------
+iceberg.product.events      | 6.86      | 3             
+iceberg.product.sessions    | 1.55      | 3             
+iceberg.product.users       | 0.16      | 3             
+iceberg.marketing.campaigns | 0.04      | 3             
+postgresql.public.licenses  | 0.01      | 3             
+(5 rows)
+
+Trend: how the team's consumption changes week by week
+
+week       | queries | cpu_hours | tib_read
+-----------+---------+-----------+---------
+2026-09-28 | 267     | 1.29      | 0.363   
+2026-10-05 | 518     | 2.74      | 0.707   
+2026-10-12 | 370     | 2.04      | 0.55    
+2026-10-19 | 311     | 1.4       | 0.416   
+2026-10-26 | 261     | 1.18      | 0.337   
+(5 rows)
+
+Trend for all teams side by side: CPU hours per team per week
+
+week       | team_name           | cpu_hours
+-----------+---------------------+----------
+2026-09-28 | Data Engineering    | 1.65     
+2026-09-28 | Product Analytics   | 1.29     
+2026-09-28 | Marketing Analytics | 0.45     
+2026-09-28 | ML Research         | 0.4      
+2026-10-05 | Product Analytics   | 2.74     
+2026-10-05 | Data Engineering    | 2.69     
+2026-10-05 | ML Research         | 0.93     
+2026-10-05 | Marketing Analytics | 0.69     
+2026-10-12 | Data Engineering    | 2.78     
+2026-10-12 | Product Analytics   | 2.04     
+2026-10-12 | ML Research         | 1.54     
+2026-10-12 | Marketing Analytics | 1.07     
+2026-10-19 | Data Engineering    | 2.38     
+2026-10-19 | ML Research         | 1.72     
+2026-10-19 | Product Analytics   | 1.4      
+2026-10-19 | Marketing Analytics | 0.88     
+2026-10-26 | Data Engineering    | 2.57     
+2026-10-26 | ML Research         | 1.48     
+2026-10-26 | Product Analytics   | 1.18     
+2026-10-26 | Marketing Analytics | 0.67     
+(20 rows)
+
+================================================================================
+sql/examples/03_query_categories.sql
+================================================================================
+
+Q3: What does a team spend its resources on?
+Split by query category (read / write / maintenance / metadata) and client.
+Sums and shares, not averages: one large MERGE and many small SELECTs
+would give a meaningless average per query.
+
+query_category | source   | queries | cpu_hours | cpu_share_pct
+---------------+----------+---------+-----------+--------------
+read           | datagrip | 713     | 4.64      | 38.4         
+write          | airflow  | 367     | 3.41      | 28.2         
+read           | jupyter  | 526     | 3.17      | 26.2         
+maintenance    | airflow  | 36      | 0.59      | 4.9          
+read           | airflow  | 40      | 0.25      | 2.1          
+metadata       | datagrip | 469     | 0.01      | 0.1          
+metadata       | jupyter  | 76      | 0.0       | 0.0          
+(7 rows)
+
+Metadata noise: many cheap queries (e.g. DataGrip introspection)
+inflate query counts but cost almost nothing.
+
+query_category | queries | query_share_pct | cpu_share_pct
+---------------+---------+-----------------+--------------
+read           | 4150    | 66.9            | 86.77        
+metadata       | 1647    | 26.6            | 0.15         
+write          | 367     | 5.9             | 11.15        
+maintenance    | 36      | 0.6             | 1.93         
+(4 rows)
+
+Distinct users per category over the period.
+Counted from the query-level fact: distinct counts cannot be summed
+from the daily aggregate (active_user_count is per row only).
+
+query_category | distinct_users
+---------------+---------------
+read           | 8             
+metadata       | 6             
+maintenance    | 1             
+write          | 1             
+(4 rows)
+
+Who writes each table: a hint for the table owner (dim_table.owner_team_id).
+Only 'write' queries: maintenance (optimize) also rewrites tables,
+but it is run by the platform, not by the table owner.
+
+output_table_key                       | team_id          | user_name   | write_queries
+---------------------------------------+------------------+-------------+--------------
+iceberg.analytics.daily_active_users   | data_engineering | svc_airflow | 119          
+iceberg.analytics.sessions_daily       | data_engineering | svc_airflow | 129          
+iceberg.marketing.campaign_performance | data_engineering | svc_airflow | 119          
+(3 rows)
+

@@ -10,6 +10,3 @@ venv/
 
 # Local env files
 .env
-
-# Results of run_all.sh
-output/

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS iceberg.meta.dim_table (
 
 -- Trino query types grouped into a few categories for reporting.
 -- Kept as a small reference table (not hard-coded in SQL), so categories
--- can be changed by editing the seed and reloading the aggregates.
+-- can be changed by editing the seed and reloading the facts and aggregates.
+-- The category of each query is resolved in 01_fact_query.sql.
 -- Grain: one row per Trino query type.
 CREATE TABLE IF NOT EXISTS iceberg.meta.dim_query_type (
     query_type      VARCHAR,   -- value of QueryCompletedEvent.queryType

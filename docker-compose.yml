@@ -37,7 +37,10 @@ services:
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.9.0
     depends_on:
-      - create-bucket
+      # Start only after the bucket exists, otherwise the first CREATE TABLE
+      # can fail with "Failed checking new table's location"
+      create-bucket:
+        condition: service_completed_successfully
     environment:
       AWS_ACCESS_KEY_ID: admin
       AWS_SECRET_ACCESS_KEY: password

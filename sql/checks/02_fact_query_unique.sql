@@ -1,6 +1,7 @@
 -- fact_query has exactly one row per query_id.
--- A duplicate counts the resources of a query twice. It appears when
--- an event is delivered twice or a day is loaded without deleting it first.
+-- A duplicate counts the resources of a query twice. The load removes
+-- duplicate events, so this is a safety net: a failure means a day was
+-- loaded without deleting it first, or user -> team periods overlap.
 SELECT
     query_id,
     count(*) AS row_count

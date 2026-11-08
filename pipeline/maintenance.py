@@ -81,7 +81,8 @@ def optimize(conn, tables: list[str], dry_run: bool) -> None:
         before = count(conn, files_sql)
         execute(conn, statement)
         after = count(conn, files_sql)
-        print(f"   {table}: data files {before} -> {after}")
+        # $files lists data files and delete files (written by DELETE / MERGE)
+        print(f"   {table}: files {before} -> {after}")
 
 
 def expire_snapshots(conn, tables: list[str], dry_run: bool) -> None:

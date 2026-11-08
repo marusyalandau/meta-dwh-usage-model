@@ -2,7 +2,8 @@
 
 Simulates what the Trino event listener would write in production:
 a mix of reads (analysts, dashboards), writes (Airflow pipelines),
-table maintenance and cheap metadata queries (e.g. DataGrip introspection).
+table maintenance and cheap metadata queries (e.g. DataGrip introspection,
+which reads information_schema and system tables).
 
 Usage:
     python -m pipeline.generate_events --start 2026-10-01 --days 31 --queries-per-day 200
@@ -12,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import uuid
 from datetime import date, datetime, time, timedelta, timezone
 
 from pipeline.trino_utils import connect, execute
@@ -30,6 +30,13 @@ TABLES = [
 ]
 ICEBERG_TABLES = [t for t in TABLES if t[0] == "iceberg"]
 
+# System tables that IDEs read to build the schema tree (metadata, not data)
+SYSTEM_TABLES = [
+    ("system", "jdbc", "tables", ["table_cat", "table_schem", "table_name", "table_type"], 200 * 1024),
+    ("system", "jdbc", "columns", ["table_schem", "table_name", "column_name", "type_name"], 2 * 1024**2),
+    ("iceberg", "information_schema", "columns", ["table_schema", "table_name", "column_name"], 1024**2),
+]
+
 # Tables produced by Airflow pipelines (targets of INSERT / MERGE)
 OUTPUT_TABLES = [
     ("iceberg", "analytics", "daily_active_users"),
@@ -42,7 +49,8 @@ QUERY_TYPES = {
     "read": (["SELECT"], [1]),
     "write": (["INSERT", "MERGE"], [7, 3]),
     "maintenance": (["ALTER_TABLE_EXECUTE", "ANALYZE"], [8, 2]),
-    "metadata": (["DESCRIBE", "EXPLAIN", "DATA_DEFINITION"], [7, 1, 2]),
+    # IDE introspection is mostly SELECTs on system tables
+    "metadata": (["SELECT", "DESCRIBE", "EXPLAIN", "DATA_DEFINITION"], [6, 2, 1, 1]),
 }
 
 ROW_TYPE = (
@@ -68,8 +76,9 @@ def pick_profile(user: str) -> tuple[str, str]:
         return "airflow", category
     if user == "svc_superset":
         return "superset", "read"
-    # Humans: DataGrip sends many metadata queries (schema introspection,
-    # DESCRIBE on table open), Jupyter notebooks mostly run plain SELECTs.
+    # Humans: DataGrip sends many metadata queries (SELECTs on system tables
+    # for the schema tree, DESCRIBE when a table is opened), Jupyter notebooks
+    # mostly run plain SELECTs.
     source = random.choice(["datagrip", "datagrip", "jupyter"])
     if source == "datagrip":
         category = random.choices(["read", "metadata"], weights=[6, 4])[0]
@@ -90,8 +99,10 @@ def fake_query(day: date) -> str:
         tables = random.sample(TABLES, k=random.choice([1, 1, 1, 2, 2, 3]))
     elif category == "maintenance":
         tables = [random.choice(ICEBERG_TABLES)]  # rewrites the table it reads
+    elif query_type == "SELECT":
+        tables = [random.choice(SYSTEM_TABLES)]  # introspection: reads system tables only
     else:
-        tables = []  # metadata queries do not read table data
+        tables = []  # DESCRIBE, EXPLAIN, DDL do not read table data
 
     if category == "write":
         output = random.choice(OUTPUT_TABLES)
@@ -151,11 +162,12 @@ def fake_query(day: date) -> str:
         "maintenance": f"ALTER TABLE {out_name} EXECUTE optimize"
         if query_type == "ALTER_TABLE_EXECUTE"
         else f"ANALYZE {out_name}",
-        "metadata": f"{query_type} ...",
+        "metadata": f"SELECT ... FROM {table_names}" if query_type == "SELECT" else f"{query_type} ...",
     }[category]
 
     values = [
-        sql_str(f"{day:%Y%m%d}_{uuid.uuid4().hex[:12]}"),
+        # Taken from the seeded random generator, so every run gives the same ids
+        sql_str(f"{day:%Y%m%d}_{random.getrandbits(48):012x}"),
         sql_str("FAILED" if failed else "FINISHED"),
         sql_str("EXCEEDED_TIME_LIMIT" if failed else None),
         sql_str(query_type),

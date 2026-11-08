@@ -32,12 +32,11 @@ ORDER BY queries DESC, query_category;
 -- Counted from the query-level fact: distinct counts cannot be summed
 -- from the daily aggregate (active_user_count is per row only).
 SELECT
-    COALESCE(qt.query_category, 'other') AS query_category,
-    count(DISTINCT f.user_name)          AS distinct_users
-FROM iceberg.meta.fact_query f
-LEFT JOIN iceberg.meta.dim_query_type qt ON qt.query_type = f.query_type
-WHERE f.query_date BETWEEN DATE '2026-10-01' AND DATE '2026-10-31'
-GROUP BY 1
+    query_category,
+    count(DISTINCT user_name) AS distinct_users
+FROM iceberg.meta.fact_query
+WHERE query_date BETWEEN DATE '2026-10-01' AND DATE '2026-10-31'
+GROUP BY query_category
 ORDER BY distinct_users DESC, query_category;
 
 -- Who writes each table: a hint for the table owner (dim_table.owner_team_id).
@@ -49,8 +48,7 @@ SELECT
     f.user_name,
     count(*) AS write_queries
 FROM iceberg.meta.fact_query f
-JOIN iceberg.meta.dim_query_type qt ON qt.query_type = f.query_type
-WHERE qt.query_category = 'write'
+WHERE f.query_category = 'write'
   AND f.query_date BETWEEN DATE '2026-10-01' AND DATE '2026-10-31'
 GROUP BY f.output_table_key, f.team_id, f.user_name
 ORDER BY output_table_key, write_queries DESC, f.team_id, f.user_name;

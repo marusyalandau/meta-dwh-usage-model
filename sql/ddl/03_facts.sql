@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS iceberg.meta.fact_query (
     team_id               VARCHAR,
     query_state           VARCHAR,
     query_type            VARCHAR,
+    query_category        VARCHAR,   -- read | write | maintenance | metadata | other, see 01_fact_query.sql
     source                VARCHAR,
     create_time           TIMESTAMP(6) WITH TIME ZONE,
     end_time              TIMESTAMP(6) WITH TIME ZONE,
@@ -17,23 +18,25 @@ CREATE TABLE IF NOT EXISTS iceberg.meta.fact_query (
     peak_memory_bytes     BIGINT,
     physical_input_bytes  BIGINT,
     output_bytes          BIGINT,
-    input_table_count     INTEGER,
+    input_table_count     INTEGER,   -- distinct data tables read (system tables not counted)
     output_table_key      VARCHAR    -- table written by the query (catalog.schema.table), NULL for reads
 )
 WITH (
     partitioning = ARRAY['query_date']
 );
 
--- Fact (bridge): one row per query x table it read.
+-- Fact (bridge): one row per query x data table it read.
 -- Used for "how many distinct users queried table X".
 -- allocated_cpu_time_ms splits the query CPU across its tables
--- (proportional to bytes read, or equally if bytes are unknown).
+-- (proportional to bytes read, or equally if bytes are unknown);
+-- the shares of one query sum exactly to its cpu_time_ms.
 CREATE TABLE IF NOT EXISTS iceberg.meta.fact_query_table_access (
     query_id              VARCHAR,
     query_date            DATE,
     user_name             VARCHAR,
     team_id               VARCHAR,
     query_type            VARCHAR,
+    query_category        VARCHAR,
     source                VARCHAR,
     table_key             VARCHAR,
     is_successful         BOOLEAN,

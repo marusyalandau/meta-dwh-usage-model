@@ -10,7 +10,7 @@ consume, and how this changes over time.
 | --- | --- |
 | Tables, granularity, relationships | [Data model](#data-model), [ER diagram](#er-diagram) |
 | SQL / Python to create and populate | `sql/ddl/`, `sql/seed/`, `sql/transform/`, `pipeline/`, [Running locally](#running-locally) |
-| Example queries | `sql/examples/`, run with `python -m pipeline.run_examples` |
+| Example queries | `sql/examples/`, run with `python -m pipeline.run_examples`; answers in [Example results](#example-results) |
 | Resource usage metrics | [Resource metrics](#resource-metrics), [Query categories](#query-categories) |
 | How data is updated | [How data is updated](#how-data-is-updated), [Data quality checks](#data-quality-checks), [Table maintenance](#table-maintenance-compaction-and-snapshots) |
 | Assumptions | [Assumptions](#assumptions) |
@@ -21,8 +21,9 @@ In short:
 - **Input:** the Trino query log (one `QueryCompletedEvent` per query) landed as
   an Iceberg table `raw.trino_query_completed`.
 - **Model:** a star schema in `meta`: four dimensions, two facts (per query and
-  per query x table read) and two daily aggregates. Every table is partitioned by
-  date and keeps history, so any period and trend can be queried.
+  per query x table read) and two daily aggregates. Facts and aggregates keep
+  full history with a date column (facts partitioned by day, aggregates by month),
+  so any period and trend can be queried.
 - **"Distinct users of table X":** `count(DISTINCT user_name)` over
   `agg_table_user_daily`, which keeps user granularity because distinct counts
   cannot be summed across days.
@@ -143,8 +144,9 @@ They have different grains and answer different questions:
 - **`fact_query_table_access`** (one row per query x table) answers *"how many
   distinct users queried table X"*. A query that reads three tables has three
   rows here, so query-level metrics like wall time would be triple-counted.
-  Only CPU is split across tables (`allocated_cpu_time_ms`), and the split sums
-  back to the query total.
+  Only CPU is split across tables (`allocated_cpu_time_ms`): the shares are whole
+  milliseconds and sum exactly to the query total (largest remainder rounding,
+  verified by check 05).
 
 ### ER diagram
 
@@ -162,8 +164,7 @@ erDiagram
     dim_table ||--o{ fact_query_table_access : "table_key"
     dim_table ||--o{ agg_table_user_daily : "table_key"
     dim_query_type ||--o{ fact_query : "query_type"
-    dim_query_type ||--o{ agg_team_resources_daily : "query_category"
-    dim_query_type ||--o{ agg_table_user_daily : "query_category"
+    dim_query_type ||--o{ fact_query_table_access : "query_type"
 
     dim_team {
         varchar team_id PK
@@ -199,6 +200,7 @@ erDiagram
         varchar user_name
         varchar team_id FK
         varchar query_type FK
+        varchar query_category
         varchar source
         bigint cpu_time_ms
         bigint wall_time_ms
@@ -211,7 +213,8 @@ erDiagram
         date query_date
         varchar user_name
         varchar team_id FK
-        varchar query_type
+        varchar query_type FK
+        varchar query_category
         varchar source
         bigint allocated_cpu_time_ms
     }
@@ -283,6 +286,9 @@ erDiagram
 | `query_category` | `read`, `write`, `maintenance` or `metadata`, see [Query categories](#query-categories) |
 | `description` | What these queries are |
 
+`query_category` is not unique, so the aggregates (grouped by category) do not
+join to this table: the category is resolved once per query in `fact_query`.
+
 **`meta.dim_table`**
 
 | Column | Description |
@@ -297,26 +303,27 @@ erDiagram
 
 | Column | Description |
 | --- | --- |
-| `query_id` | Trino query id |
+| `query_id` | Trino query id; unique (duplicate events are removed at load) |
 | `query_date` | UTC date of `end_time`; partition key |
 | `user_name` | Trino user |
 | `team_id` | User's team on `query_date` (from `dim_user_team`), `unknown` if not found |
 | `query_state`, `query_type`, `source` | Copied from raw |
+| `query_category` | Category from `dim_query_type`; a `SELECT` that reads no data tables is `metadata` (see [Query categories](#query-categories)) |
 | `create_time`, `end_time` | Copied from raw |
 | `cpu_time_ms`, `wall_time_ms`, `queued_time_ms`, `peak_memory_bytes`, `physical_input_bytes`, `output_bytes` | Full resource usage of the query |
-| `input_table_count` | Number of tables the query read |
+| `input_table_count` | Number of distinct data tables the query read (system tables not counted) |
 | `output_table_key` | Table the query wrote (`catalog.schema.table`), NULL for reads |
 
 **`meta.fact_query_table_access`**
 
 | Column | Description |
 | --- | --- |
-| `query_id`, `query_date`, `user_name`, `team_id`, `query_type`, `source` | Same as in `fact_query` |
-| `table_key` | Table read by the query |
+| `query_id`, `query_date`, `user_name`, `team_id`, `query_type`, `query_category`, `source` | Same as in `fact_query` |
+| `table_key` | Data table read by the query (`information_schema` and the `system` catalog are left out) |
 | `is_successful` | True if the query finished successfully |
 | `column_count` | Number of columns read from this table |
 | `physical_input_bytes` | Bytes read from this table |
-| `allocated_cpu_time_ms` | Share of the query CPU attributed to this table (proportional to bytes read, equal split if bytes are unknown) |
+| `allocated_cpu_time_ms` | Share of the query CPU attributed to this table: proportional to bytes read, equal split if bytes are unknown for any table of the query. Shares sum exactly to the query CPU |
 
 **`meta.agg_table_user_daily`**
 
@@ -381,10 +388,10 @@ detailed for reports, so `dim_query_type` groups them into four categories:
 
 | Category | Trino query types | Typical workload |
 | --- | --- | --- |
-| `read` | `SELECT` | Analysis, dashboards, exports |
+| `read` | `SELECT` that reads data tables | Analysis, dashboards, exports |
 | `write` | `INSERT` (incl. `CREATE TABLE AS`), `MERGE`, `UPDATE`, `DELETE` | Pipelines that build and update tables |
 | `maintenance` | `ALTER_TABLE_EXECUTE`, `ANALYZE` | Compaction, snapshot expiry, statistics |
-| `metadata` | `DATA_DEFINITION`, `DESCRIBE`, `EXPLAIN` | CREATE / DROP / ALTER, SHOW and DESCRIBE, query plans |
+| `metadata` | `DATA_DEFINITION`, `DESCRIBE`, `EXPLAIN`, and `SELECT` that reads no data tables | CREATE / DROP / ALTER, SHOW and DESCRIBE, query plans, IDE introspection, `SELECT 1` |
 
 Why these four:
 
@@ -394,41 +401,89 @@ Why these four:
 - **`maintenance`** is kept apart so that a weekly `optimize` does not look like
   a team suddenly writing a lot.
 - **`metadata`** queries are almost free but very numerous. IDEs such as DataGrip
-  send many of them on their own: schema introspection when connecting, `DESCRIBE`
-  when a table is opened. Without a separate category they inflate query counts
-  and make "who is active" look different from "who uses resources". In the local
-  sample data they are 25% of all queries but 0.1% of CPU.
+  send many of them on their own: to build the schema tree they run `SELECT`s on
+  `information_schema` and `system.jdbc` tables when connecting or refreshing, and
+  `SHOW` / `DESCRIBE` when a table is opened. Without a separate category they
+  inflate query counts and make "who is active" look different from "who uses
+  resources". In the local sample data they are 27% of all queries but 0.15% of CPU.
+- **System tables are not data tables.** `information_schema` (in every catalog)
+  and the `system` catalog are left out of `fact_query_table_access` and
+  `dim_table`, so introspection never makes someone a "user of a table". A `SELECT`
+  that reads only system tables, or no tables at all (`SELECT 1` connection
+  checks), is therefore `metadata`, not `read`.
 - **Client (`source`)** is reported next to the category: `airflow` (scheduled
   pipelines), `superset` (dashboards), `datagrip` / `jupyter` (manual work).
-  Together they give a breakdown like "Data Engineering: 27% of CPU is `write`
-  from `airflow`, 37% is `read` from `datagrip`".
+  Together they give a breakdown like "Data Engineering: 28% of CPU is `write`
+  from `airflow`, 38% is `read` from `datagrip`".
 
 Design decisions:
 
-- The original `query_type` is kept in the facts; the category is looked up in the
-  aggregates. To change the grouping, edit `sql/seed/03_dim_query_type.sql` and
-  reload the aggregates; raw data and facts stay as they are. Unknown types are
+- The category is resolved once per query when `fact_query` is loaded
+  (`dim_query_type` plus the `SELECT` rule above) and copied to the other tables,
+  so every report uses the same category. The original `query_type` is kept too.
+  To change the grouping, edit `sql/seed/03_dim_query_type.sql` and reload the
+  period with `run_daily` (a backfill); raw data stays as it is. Unknown types are
   reported as `other`.
 - Reports use **sums and shares**, not averages per query: one large `MERGE` and a
   thousand small `SELECT`s give a meaningless average.
 - Adding category and client to the aggregates multiplies rows only by the number
   of combinations actually used (a few per team or user per day), not by the
   number of queries.
-- `active_user_count` is now distinct users within a day x team x category x client
-  row and cannot be summed. Distinct users for any period or slice are counted with
+- `active_user_count` counts distinct users within one day x team x category x
+  client row and cannot be summed. Distinct users for any period or slice are counted with
   `count(DISTINCT user_name)` on `fact_query` or `agg_table_user_daily`.
   For very large volumes, approximate distinct counts can be stored as HyperLogLog
   sketches (`approx_set` / `merge` in Trino) instead.
 - Writes also tell who produces a table (`fact_query.output_table_key`), which is
   a useful hint for the table owner (`dim_table.owner_team_id`).
 
-See `sql/examples/03_query_categories.sql`.
+See `sql/examples/03_query_categories.sql` and [Example results](#example-results).
+
+## Example results
+
+Answers of `sql/examples/` on the local sample data (October 2026, 200 fake
+queries per day). The full output is in `output/example_results.txt`;
+`bash run_all.sh` produces exactly the same numbers (fixed random seed).
+
+**Q1. Distinct users of `iceberg.product.events` in October:** 8 users, 1,510
+queries. The weekly trend is flat: all 8 users read it every week.
+
+**Q2. Resources of Product Analytics in October:** 1,727 queries, 8.64 CPU hours,
+2.37 TiB read; 6.86 of the CPU hours went to `iceberg.product.events`.
+
+**Team history (SCD Type 2) in the weekly trend.** `anna` moved from Product
+Analytics to ML Research on 15 October. Her queries before that date stay with
+Product Analytics, later ones go to ML Research, so the two teams cross over:
+
+| Week starting | Product Analytics, CPU h | ML Research, CPU h |
+| --- | --- | --- |
+| 2026-09-28 (only 1-4 Oct) | 1.29 | 0.40 |
+| 2026-10-05 | 2.74 | 0.93 |
+| 2026-10-12 (move on 15 Oct) | 2.04 | 1.54 |
+| 2026-10-19 | 1.40 | 1.72 |
+| 2026-10-26 (only 26-31 Oct) | 1.18 | 1.48 |
+
+The first and last weeks are partial, so their numbers are lower.
+
+**Q3. What Data Engineering spends CPU on:** 38% `read` from DataGrip, 28% `write`
+from Airflow, 26% `read` from Jupyter, 5% `maintenance`. Across all teams,
+`metadata` queries are 27% of all queries but 0.15% of CPU. All writes to the
+three output tables come from `svc_airflow` (Data Engineering), a hint for the
+table owner.
 
 ## How data is updated
 
 - Each transformation in `sql/transform/` loads **one date** (`{{ run_date }}`).
-- Loads are idempotent: the date partition is deleted and re-inserted
+- Loads are idempotent: the rows of the date are deleted and re-inserted
   (`dim_table` uses `MERGE`), so re-runs and backfills are safe.
+- Raw events are deduplicated by `query_id` during the load: event delivery is
+  at-least-once, so the same event can arrive twice.
+- Raw events and facts are partitioned by day: a daily load replaces exactly one
+  partition, and reports read only the days they need. Aggregates are partitioned
+  by month: they have a few hundred rows per day, so daily partitions would hold
+  tiny files, and a month is still quick to read. Reloading one day inside a
+  monthly partition is a row-level delete that writes small delete files; the
+  weekly compaction merges them away. Dimensions are small and not partitioned.
 - Files are numbered in dependency order.
 - In production this is an Airflow DAG with one run per logical date;
   a backfill is the same DAG run for past dates.
@@ -470,21 +525,23 @@ print a warning: the data is still correct, but something needs attention.
 | Check | What it catches |
 | --- | --- |
 | `01_raw_no_empty_days` | A day without any events: event delivery was down |
-| `02_fact_query_unique` | The same query loaded twice, so its resources are counted twice |
+| `02_fact_query_unique` | The same query loaded twice, so its resources are counted twice (a safety net: the load already drops duplicate events) |
 | `03_fact_query_matches_raw` | Queries lost or duplicated between `raw` and `fact_query` |
 | `04_fact_query_required_fields` | Empty keys (user, team, query type) or negative metrics |
-| `05_table_access_cpu_matches_query` | Per-table CPU does not add up to the query CPU (0.5 ms rounding per table is allowed) |
+| `05_table_access_cpu_matches_query` | Per-table CPU does not add up exactly to the query CPU, or a table row is missing |
 | `06_agg_team_resources_matches_fact` | Team aggregate differs from `fact_query`: queries, CPU or bytes per day |
 | `07_agg_table_user_matches_access` | Table aggregate differs from `fact_query_table_access` |
 | `08_dim_table_covers_access` | A table read in the period is missing from `dim_table` |
 | `09_users_without_team` (warn) | Users missing from the directory; their usage goes to `unknown` |
 | `10_unknown_query_types` (warn) | Query types missing from `dim_query_type`; reported as `other` |
+| `11_dim_user_team_no_overlaps` | Overlapping user -> team periods: a query would get two teams and be loaded twice |
 
 `run_all.sh` runs the checks for the whole period right after the load; other
 ways to run them are in [Running locally](#running-locally). Every check was
-also tried on deliberately broken data (a raw event delivered twice, part of
-an aggregate day deleted, an unknown user and query type, a table removed from
-`dim_table`) and reported exactly the broken rows.
+also tried on deliberately broken data (part of an aggregate day deleted, an
+unknown user and query type, a table removed from `dim_table`, overlapping team
+periods) and reported exactly the broken rows. A raw event delivered twice no
+longer breaks anything: the load drops the copy and all checks pass.
 
 The checks compare the model with `raw`, so they are meant for recently loaded
 days. After retention has removed old raw events, checks 01 and 03 fail for those
@@ -532,13 +589,10 @@ Two kinds of garbage pile up over time:
   drops snapshots older than 7 days and deletes files no snapshot refers to.
   `remove_orphan_files` cleans up files left by failed writes.
 
-Proposed schedule: a weekly maintenance job that runs `optimize` and then
-`expire_snapshots` (7 days) on every table of the model; the 7 days are the
-window in which a bad load can still be rolled back with time travel.
-
-`pipeline/maintenance.py` implements this job: retention, then `optimize`,
-`expire_snapshots` (7 days) and `remove_orphan_files` for every table in `raw`
-and `meta`. Retention periods are set at the top of the script. In production it
+`pipeline/maintenance.py` is a weekly job that runs, for every table in `raw` and
+`meta`: retention, then `optimize`, `expire_snapshots` (7 days: the window in
+which a bad load can still be rolled back with time travel) and
+`remove_orphan_files`. Retention periods are set at the top of the script. In production it
 is a weekly Airflow DAG; locally `run_all.sh` runs it as the last step (see
 [Running locally](#running-locally) for other options).
 
@@ -547,8 +601,8 @@ What it does on the local sample data (October 2026):
 - `--as-of 2027-01-15` deletes the raw events of 1-16 October (older than 90
   days on that date); facts and aggregates are kept.
 - `optimize` compacts each aggregate from 31 small files (one per daily load)
-  into one, and `dim_table` from 61 files (every daily `MERGE` adds files) into
-  one. Facts already have one file per daily partition, so there is nothing to
+  into one, and `dim_table` from 61 files (every daily `MERGE` adds a data file
+  and a delete file) into one. Facts already have one file per daily partition, so there is nothing to
   merge.
 - `expire_snapshots` removes nothing locally: all snapshots are younger than 7
   days, and Trino does not accept a shorter threshold by default
@@ -575,13 +629,25 @@ What it does on the local sample data (October 2026):
   BI dashboards) would end up in `unknown`.
 - **Users missing from the directory go to the `unknown` team** instead of being
   dropped, so total resources always add up.
+- **Events can arrive more than once** (at-least-once delivery), but `query_id`
+  is unique per query, so duplicates are dropped at load.
 - **A query reading several tables:** full resources stay on `fact_query`; per-table
-  CPU is allocated proportionally to bytes read (equally if bytes are unknown).
-  A table that produced more data usually cost more CPU to scan, so this is a
-  reasonable approximation without per-operator statistics.
-- **Non-Iceberg catalogs** (e.g. PostgreSQL) are kept and flagged with
-  `dim_table.is_iceberg`. They still consume Trino resources, and filtering them
+  CPU is allocated proportionally to bytes read (equally if bytes are unknown for
+  any of them). A table that produced more data usually cost more CPU to scan, so
+  this is a reasonable approximation without per-operator statistics.
+- **A query can read several data sources.** Trino can join an Iceberg table with,
+  for example, a PostgreSQL table in one query. Such a query is one row in
+  `fact_query`, and each table, whatever its catalog, gets its own row and CPU
+  share in `fact_query_table_access`. Non-Iceberg tables are kept and flagged with
+  `dim_table.is_iceberg`: they still consume Trino resources, and filtering them
   out is a one-line `WHERE`.
+- **The table format is derived from the catalog name.** `is_iceberg` is true when
+  the catalog is called `iceberg`. This holds locally but not in general (catalogs
+  can be named `lake`, `iceberg_prod`, ...). In production it should come from the
+  catalog configuration: `system.metadata.catalogs` gives the connector of each
+  catalog.
+- **System tables are metadata, not data.** Reads of `information_schema` and of
+  the `system` catalog (IDE introspection) are not counted as table usage.
 - **Failed queries count towards resource usage.** They used CPU and read data
   before failing, so they cost the cluster the same.
 - **A "day" is the UTC date of the query `end_time`.** UTC avoids time zone and
@@ -601,7 +667,7 @@ sql/examples/             queries answering the task questions
 pipeline/                 Python: init, fake event generator, daily runner, checks,
                           maintenance, example runner
 run_all.sh                runs the whole local pipeline end to end
-output/                   example query results written by run_all.sh (not in git)
+output/                   example query results, rewritten by every run of run_all.sh
 ```
 
 ## Running locally
