@@ -1,0 +1,60 @@
+# Local sandbox that mimics the production stack:
+#   S3 (SeaweedFS, S3-compatible)  ->  Iceberg REST catalog  ->  Trino
+# Everything is ephemeral: `docker compose down` wipes all data and the catalog.
+# `bash run_all.sh` starts this stack and runs the whole pipeline (see README).
+
+services:
+  # S3-compatible object storage. Plays the role of Amazon S3.
+  # Credentials (admin / password) are defined in seaweedfs/s3.json.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    command: "server -s3 -dir=/data -s3.port=8333 -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    ports:
+      - "8333:8333"   # S3 API
+
+  # One-shot job that creates the `warehouse` bucket and exits.
+  create-bucket:
+    image: amazon/aws-cli:2.17.0
+    depends_on:
+      - seaweedfs
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://seaweedfs:8333 s3 ls s3://warehouse 2>/dev/null \
+           || aws --endpoint-url http://seaweedfs:8333 s3 mb s3://warehouse; do
+          echo "waiting for seaweedfs..."; sleep 2;
+        done
+        echo "bucket s3://warehouse is ready"
+
+  # Iceberg REST catalog: maps table names to their current metadata.json in S3.
+  # The catalog itself is kept in memory (SQLite), so it is reset on restart.
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.0
+    depends_on:
+      - create-bucket
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+
+  # Trino: the SQL engine. Web UI and API on http://localhost:8080
+  trino:
+    image: trinodb/trino:467
+    depends_on:
+      - iceberg-rest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
